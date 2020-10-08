@@ -1,5 +1,8 @@
+.cache/
+.testdest/
 target/
 *~
 *#
 .#*
-mycache.data
+khao_config.json
+khao_metadata.json
