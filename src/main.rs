@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use reqwest;
 use serde_json;
 use tokio;
@@ -43,13 +45,42 @@ struct GameConfig {
 #[serde(rename_all = "camelCase")]
 struct FileInfo {}
 
-fn read_cache(path: &Path) -> Result<Vec<FileInfo>> {
+/// User-defined configuration
+#[derive(Serialize, Deserialize)]
+struct Config {
+    /// Optional plugin destination dir
+    /// If not present, will be set to system default
+    /// On OSX this is `~/Documents/Elder\ Scrolls\ Online/live/AddOns/`
+    dest: Option<String>,
+    /// List of add-on titles to manage, like `AUI - Advanced UI`.
+    addons: Vec<String>
+}
+
+/// Information about a managed add-on
+#[derive(Serialize, Deserialize)]
+struct InstalledAddon {
+    /// The title of the addon (either matching that in `Config.addons` or a dep of one of those)
+    title: String,
+    /// Checksum to detect changes when `filelist.json` gets updated
+    checksum: String,
+    /// Path relative to `dest`
+    path: String
+}
+
+/// Tool metadata about installed versions
+#[derive(Serialize, Deserialize)]
+struct Metadata {
+    /// List of info about managed addons (or deps of those)
+    installed_addons: Vec<InstalledAddon>
+}
+
+fn read_file_list(path: &Path) -> Result<Vec<FileInfo>> {
     let file = File::open(path)?;
     let val = serde_json::from_reader(&file)?;
     Ok(val)
 }
 
-async fn write_cache(path: &Path) -> Result<Vec<FileInfo>> {
+async fn write_file_list(path: &Path) -> Result<Vec<FileInfo>> {
     let global_config: GlobalConfig = reqwest::get(GLOBAL_CONFIG_URL).await?.json().await?;
 
     let game = global_config
@@ -89,17 +120,38 @@ async fn write_cache(path: &Path) -> Result<Vec<FileInfo>> {
     Ok(file_list)
 }
 
+fn read_config(path: &Path) -> Result<Config> {
+    let file = File::open(path)?;
+    let val = serde_json::from_reader(&file)?;
+    Ok(val)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cache = Path::new("mycache.data");
+    // TODO add CLI configuration
 
-    let file_list = if cache.exists() {
-        read_cache(&cache)?
+    // TODO write to /tmp or something
+    std::fs::create_dir_all(".cache")?;
+
+    // TODO We'll start by downloading plugins into this fake destination
+    std::fs::create_dir_all(".testdest")?;
+
+    let file_list_path = Path::new(".cache/filelist.json");
+    // TODO verify there is a config
+    // let config_path = Path::new("khao_config.json");
+    // let metadata_path = Path::new("khao_metadata.json");
+
+    let file_list = if file_list_path.exists() {
+        read_file_list(&file_list_path)?
     } else {
-        write_cache(&cache).await?
+        write_file_list(&file_list_path).await?
     };
 
     println!("{}", serde_json::to_string_pretty(&file_list)?);
+
+    // TODO read config and download addons
+    // let config = read_config(&config_path)?;
+    // println!("{}", serde_json::to_string_pretty(&config)?);
 
     Ok(())
 }

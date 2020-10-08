@@ -1,6 +1,6 @@
 .PHONY: clean
 clean:
-	rm -f mycache.data
+	rm -rf .cache
 	cargo clean
 
 .PHONY: run
