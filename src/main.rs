@@ -5,16 +5,43 @@ use serde_json;
 use tokio;
 
 use anyhow::Result;
+use dirs::home_dir;
+use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::io::BufReader;
+use std::io::BufRead;
+use std::collections::HashMap;
+use regex::Regex;
+use multimap::MultiMap;
 
+// URLs
 const GLOBAL_CONFIG_URL: &str = "https://api.mmoui.com/v4/globalconfig.json";
 const ESO_GAME_ID: &str = "ESO";
 const GAME_CONFIG_URL: &str = "https://api.mmoui.com/v4/game/ESO/gameconfig.json";
 const FILE_LIST_URL: &str = "https://api.mmoui.com/v4/game/ESO/filelist.json";
 
+// PATHs
+macro_rules! _eso_proto_path {
+    () => {
+        "Elder Scrolls Online/live/AddOns/"
+    };
+}
+macro_rules! _windows_path {
+    () => {
+        concat!("My Documents/", _eso_proto_path!())
+    };
+}
+const WINDOWS_PATH: &str = _windows_path!();
+const OSX_PATH: &str = concat!("Documents/", _eso_proto_path!());
+const STEAM_PREFIX_PATH: &str = concat!(
+    ".local/share/Steam/steamapps/compatdata/306130/pfx/drive_c/users/steamuser/",
+    _windows_path!()
+);
+
+// API JSON Types
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Game {
@@ -43,8 +70,27 @@ struct GameConfig {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FileInfo {}
+struct AddonInfo {
+    path: String,
+    add_on_version: String,
+    optional_dependencies: Option<Vec<String>>,
+    required_dependencies: Option<Vec<String>>,
+    library: Option<bool>,
+}
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileInfo {
+    title: String,
+    version: String,
+    api_version: Option<String>,
+    library: Option<bool>,
+    addons: Option<Vec<AddonInfo>>,
+}
+
+
+
+/*
 /// User-defined configuration
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -53,25 +99,53 @@ struct Config {
     /// On OSX this is `~/Documents/Elder\ Scrolls\ Online/live/AddOns/`
     dest: Option<String>,
     /// List of add-on titles to manage, like `AUI - Advanced UI`.
-    addons: Vec<String>
+    addons: Vec<String>,
 }
+ */
 
 /// Information about a managed add-on
-#[derive(Serialize, Deserialize)]
+//#[derive(Serialize, Deserialize)]
 struct InstalledAddon {
     /// The title of the addon (either matching that in `Config.addons` or a dep of one of those)
     title: String,
     /// Checksum to detect changes when `filelist.json` gets updated
-    checksum: String,
+    version: Option<String>,
+    version_name: Option<String>,
     /// Path relative to `dest`
-    path: String
+    name: String,
+    path: String,
+    is_lib: bool,
 }
 
+/*
 /// Tool metadata about installed versions
 #[derive(Serialize, Deserialize)]
 struct Metadata {
+
     /// List of info about managed addons (or deps of those)
-    installed_addons: Vec<InstalledAddon>
+    installed_addons: Vec<InstalledAddon>,
+}
+*/
+
+fn compare_versions (addon:&InstalledAddon, latest:&FileInfo) -> bool{
+    match &addon.version {
+        Some(v) => {
+            if let Some(v2) = &latest.api_version{
+                if v == v2 {//println!("up to date: {}", &path);
+                    return true;
+                }
+            }
+        },
+        None => ()
+    }
+
+    if let Some(v) = &addon.version_name {
+        if v == &latest.version {//println!("up to date: {}", &path);
+            return true;
+        }
+    }
+
+    false
 }
 
 fn read_file_list(path: &Path) -> Result<Vec<FileInfo>> {
@@ -120,9 +194,112 @@ async fn write_file_list(path: &Path) -> Result<Vec<FileInfo>> {
     Ok(file_list)
 }
 
+/*
 fn read_config(path: &Path) -> Result<Config> {
     let file = File::open(path)?;
-    let val = serde_json::from_reader(&file)?;
+
+    println!("  let val = serde_json::from_reader(&file)?;
+    Ok(val)
+}*/
+
+fn parse_addon_manifest(path: &Path) -> Result<Option<InstalledAddon>> {
+    let mut is_lib = false;
+
+    let file = File::open(path)?;
+    let buffered = BufReader::new(file);
+
+    let mut title = "".to_string();
+    let mut version_name:Option<String> = None;
+    let mut version:Option<String> = None;
+
+
+    let filter_junk = Regex::new("\\|r|\\|[a-fA-F0-9]{7}|(?: )v?[0-9]{1,2}(?:\\.[0-9]{1,2}){1,2}"/*?(.*?)(?: v[0-9]{1,2}(?:.[0-9]{1,2}){1,2})?(.*?)$"*/).unwrap();
+
+    let filter_noninstalled = Regex::new("Data File").unwrap();
+
+
+    //println!(">>>> {:?}", path);
+    for l in buffered.lines() {
+        if let Ok(line) = l {
+            let mut iter = line.split_whitespace();
+            if let Some("##") = iter.next() {
+                match iter.next() {
+                    Some("Title:") => {//println!("{:?}", line);
+                        let foo = line.strip_prefix("## Title: ").unwrap().trim()/*.to_string()*/;
+
+                        if filter_noninstalled.is_match(foo){ return Ok(None);}
+
+                        title = filter_junk.replace_all(foo, "").trim().to_string();
+
+                        if title.len() == 0 {println!("  parse of {} came up empty", line);}
+
+                    },
+                    Some("Version:") => {//println!("{:?}", line);
+                                         //version_name = Some(iter.next().unwrap_or_default().to_string());
+                                         version_name = match iter.next() {
+                                             Some(vers) => Some(vers.to_string()),
+                                             None => None,
+                                         }
+                    },
+                    Some("AddOnVersion:") => {//println!("{:?}", line);
+                                              version = match iter.next() {
+                                                  Some(vers) => Some(vers.to_string()),
+                                                  None => None,
+                                              }
+                    },
+                    Some("IsLibrary:") => {//println!("{:?}", line);
+                        is_lib = iter.next().unwrap().to_lowercase().parse()?
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+
+
+    Ok(Some(InstalledAddon{title: title, version: version, version_name: version_name, path: path.parent().unwrap().to_str().unwrap().to_string(), is_lib: is_lib, name: path.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string()}))
+}
+
+fn read_installed_addons() -> Result<HashMap<String,InstalledAddon>> {
+    let addon_dir = home_dir().unwrap().join(if cfg!(macos) {
+        OSX_PATH
+    } else if cfg!(unix) {
+        STEAM_PREFIX_PATH
+    } else if cfg!(windows) {
+        WINDOWS_PATH
+    } else {
+        "failzor"
+    });
+
+    println!("{}", addon_dir.as_path().to_str().unwrap());
+    let mut val = HashMap::new();
+
+    /*for entry in addon_dir.read_dir().expect("read_dir call failed") {
+            if let Ok(entry) = entry {
+                //println!("{:?}", entry.path());
+                if entry.is_dir() {
+                    for subentry in addon_dir.read_dir().expect("read_dir call failed") {
+                        if let Ok(subentry) = subentry {
+                        }
+                    }
+                }
+            }
+    }*/
+
+    let pat = addon_dir.as_path().to_str().unwrap().to_owned() + "*/*.txt";
+    let filter_spaces = Regex::new("\\s")?;
+
+    for entry in glob(&pat).expect("Failed to read glob pattern") {
+        match entry {
+            Ok(path) => {
+                if let Some(addon) = parse_addon_manifest(&path)? {
+                    val.insert(filter_spaces.replace_all(&addon.name, "").to_lowercase().to_string() , addon);
+                }
+            },
+            Err(e) => println!("{:?}", e),
+        }
+    }
+
     Ok(val)
 }
 
@@ -134,24 +311,107 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(".cache")?;
 
     // TODO We'll start by downloading plugins into this fake destination
-    std::fs::create_dir_all(".testdest")?;
+    //std::fs::create_dir_all(".testdest")?;
 
     let file_list_path = Path::new(".cache/filelist.json");
     // TODO verify there is a config
     // let config_path = Path::new("khao_config.json");
     // let metadata_path = Path::new("khao_metadata.json");
 
-    let file_list = if file_list_path.exists() {
+    let _installed_map = read_installed_addons()?;
+
+    let _file_list = if file_list_path.exists() {
         read_file_list(&file_list_path)?
     } else {
         write_file_list(&file_list_path).await?
     };
 
-    println!("{}", serde_json::to_string_pretty(&file_list)?);
+
+    /*
+     *    Unfortunately there is no global namespace for ESO addons.
+     *  There are three candidates for how we identify addons, each with flaws:
+     *     1) the "Title" field in the addon manifest:
+     *        - color escapes are common in the title (but not in the api)
+     *        - the API title doesn't come from or match the manifest, seems like maybe its supplied on upload
+     *        - some authors put full version in the manifest title, this will never help us find an updated version
+     *        - sometimes capitalization/spacing is different
+     *    2) the directory name (path) of the addon
+     *        - this is not unique, often there are patches and localizations that share the path
+     *    3) the api ID
+     *        - doesn't exist in the manifest, so we can only use this if we disregard existing installs and
+     *              track separate metadata when installing to remember where it came from
+     */
+
+    // for right now #2 gets most things right, just need some conflict resolution (maybe using author too)
+    // and a map of string => vector of addons to handle multiple addons with the same path
+
+    let filter_spaces = Regex::new("\\s")?;
+    let mut _file_map = MultiMap::new();
+    for mut x in _file_list {
+        // XXX: why do I need to borrow?
+        if let Some(addons) = &x.addons {
+            for addon in addons {
+                if None == addon.path.find('/') {
+                    if let Some(ver) = &x.api_version {
+                        if &addon.add_on_version != ver {
+                            println!("mismatch {} {}", &addon.add_on_version, &ver);
+                        }
+                    } else {
+                       // println!("supp;ying missing version");
+                        x.api_version = Some(addon.add_on_version.clone());
+                    }
+
+                    _file_map.insert(filter_spaces.replace_all(&addon.path, "").to_lowercase().to_string(), x);
+                    break;
+                }
+            }
+        }
+
+        //_file_map.insert(filter_spaces.replace_all(&x.title, "").to_lowercase().to_string(), &x);
+    }
+
+    //println!("{}", serde_json::to_string_pretty(&file_list)?);
 
     // TODO read config and download addons
     // let config = read_config(&config_path)?;
     // println!("{}", serde_json::to_string_pretty(&config)?);
+
+
+
+    // check all installed items are up to date
+    let mut outdated = HashMap::new();
+
+    'outer: for (path, addon) in _installed_map {
+        if _file_map.is_vec(&path) {
+            for latest in _file_map.get_vec(&path).unwrap() {
+                //if addon.title == latest.title {
+                    if compare_versions(&addon, &latest) {
+                        continue 'outer;
+                    }
+                //}
+            }
+            println!("  multi-outdated: {}", &path);
+        } else {
+            let lookup = _file_map.get(&path);
+
+            if let Some(latest) = lookup {
+                if compare_versions(&addon, &latest) {
+                    continue;
+                }
+                println!("  outdated: {:?} {:?} {:?}", &path, &addon.version_name, &latest.version);
+                outdated.insert(&latest.title, latest);
+            } else {
+                println!("    {} {} no longer exists upstream!", addon.name, &path);
+            }
+        }
+    }
+
+
+    // check for a downloaded and installed version, and verify checksum
+
+    // check for a downloaded archive and verify check sum, else
+
+    // fetch, extract, install
 
     Ok(())
 }
