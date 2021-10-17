@@ -8,7 +8,7 @@ edition = "2018"
 
 [dependencies]
 anyhow = "^1.0.33"
-reqwest = { version = "^0.10.8", features = ["json"] }
+reqwest = { version = "^0.10.8", features = ["json","stream"] }
 serde = { version = "^1.0.116", features = ["derive"] }
 serde_json = "^1.0.58"
 tokio = { version = "^0.2", features = ["macros"] }
@@ -16,4 +16,8 @@ dirs = "^3.0.1"
 glob = "^0.3.0"
 regex = "^1"
 multimap = "^0.8.2"
+futures-util = "^0.3.12"
+md-5 = "^0.9.1"
+hex = "^0.4.2"
+generic-array = "^0"
 #itertools = "^0.10"

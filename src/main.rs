@@ -4,6 +4,8 @@ use reqwest;
 use serde_json;
 use tokio;
 
+use futures_util::StreamExt;
+
 use anyhow::Result;
 use dirs::home_dir;
 use glob::glob;
@@ -16,12 +18,16 @@ use std::io::BufRead;
 use std::collections::HashMap;
 use regex::Regex;
 use multimap::MultiMap;
+use md5::{Md5,Digest};
+use hex::FromHex;
+use generic_array::GenericArray;
 
 // URLs
 const GLOBAL_CONFIG_URL: &str = "https://api.mmoui.com/v4/globalconfig.json";
 const ESO_GAME_ID: &str = "ESO";
 const GAME_CONFIG_URL: &str = "https://api.mmoui.com/v4/game/ESO/gameconfig.json";
 const FILE_LIST_URL: &str = "https://api.mmoui.com/v4/game/ESO/filelist.json";
+const FILE_DETAILS_URL: &str = "https://api.mmoui.com/v4/game/ESO/filedetails/";
 
 // PATHs
 macro_rules! _eso_proto_path {
@@ -42,7 +48,7 @@ const STEAM_PREFIX_PATH: &str = concat!(
 );
 
 // API JSON Types
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Game {
     #[serde(alias = "gameID")]
@@ -50,25 +56,37 @@ struct Game {
     game_config: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GlobalConfig {
     games: Vec<Game>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize,Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiFeeds {
     file_list: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize,Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GameConfig {
     api_feeds: ApiFeeds,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileDetails {
+    id: u16,
+    title: String,
+    version: String,
+    file_name: String,
+    download_uri: String,
+
+    checksum: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AddonInfo {
     path: String,
@@ -78,17 +96,21 @@ struct AddonInfo {
     library: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FileInfo {
+    id: u16,
     title: String,
     version: String,
-    api_version: Option<String>,
     library: Option<bool>,
     addons: Option<Vec<AddonInfo>>,
+
+    checksum: String,
+
+    // we parse out a version from the addons vec and stick it here
+    #[serde(skip)]
+    nested_version: Option<String>,
 }
-
-
 
 /*
 /// User-defined configuration
@@ -130,7 +152,7 @@ struct Metadata {
 fn compare_versions (addon:&InstalledAddon, latest:&FileInfo) -> bool{
     match &addon.version {
         Some(v) => {
-            if let Some(v2) = &latest.api_version{
+            if let Some(v2) = &latest.nested_version{
                 if v == v2 {//println!("up to date: {}", &path);
                     return true;
                 }
@@ -213,19 +235,18 @@ fn parse_addon_manifest(path: &Path) -> Result<Option<InstalledAddon>> {
     let mut version:Option<String> = None;
 
 
-    let filter_junk = Regex::new("\\|r|\\|[a-fA-F0-9]{7}|(?: )v?[0-9]{1,2}(?:\\.[0-9]{1,2}){1,2}"/*?(.*?)(?: v[0-9]{1,2}(?:.[0-9]{1,2}){1,2})?(.*?)$"*/).unwrap();
+    let filter_junk = Regex::new("\\|r|\\|[a-fA-F0-9]{7}|(?: )v?[0-9]{1,2}(?:\\.[0-9]{1,2}){1,3}").unwrap();
 
     let filter_noninstalled = Regex::new("Data File").unwrap();
 
 
-    //println!(">>>> {:?}", path);
     for l in buffered.lines() {
         if let Ok(line) = l {
             let mut iter = line.split_whitespace();
             if let Some("##") = iter.next() {
                 match iter.next() {
                     Some("Title:") => {//println!("{:?}", line);
-                        let foo = line.strip_prefix("## Title: ").unwrap().trim()/*.to_string()*/;
+                        let foo = line.strip_prefix("## Title: ").unwrap().trim();
 
                         if filter_noninstalled.is_match(foo){ return Ok(None);}
 
@@ -257,7 +278,12 @@ fn parse_addon_manifest(path: &Path) -> Result<Option<InstalledAddon>> {
     }
 
 
-    Ok(Some(InstalledAddon{title: title, version: version, version_name: version_name, path: path.parent().unwrap().to_str().unwrap().to_string(), is_lib: is_lib, name: path.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string()}))
+    Ok(Some(InstalledAddon{title: title,
+                           version: version,
+                           version_name: version_name,
+                           path: path.parent().unwrap().to_str().unwrap().to_string(),
+                           is_lib: is_lib,
+                           name: path.parent().unwrap().file_name().unwrap().to_str().unwrap().to_string()}))
 }
 
 fn read_installed_addons() -> Result<HashMap<String,InstalledAddon>> {
@@ -305,22 +331,26 @@ fn read_installed_addons() -> Result<HashMap<String,InstalledAddon>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cache_dir = Path::new(".cache");
+    let download_dir = cache_dir.join("downloads");
+    let staging_dir = cache_dir.join("staging");
     // TODO add CLI configuration
 
     // TODO write to /tmp or something
-    std::fs::create_dir_all(".cache")?;
+    std::fs::create_dir_all(&cache_dir)?;
+    std::fs::create_dir_all(&download_dir)?;
 
     // TODO We'll start by downloading plugins into this fake destination
     //std::fs::create_dir_all(".testdest")?;
 
-    let file_list_path = Path::new(".cache/filelist.json");
+    let file_list_path = cache_dir.join("filelist.json");
     // TODO verify there is a config
     // let config_path = Path::new("khao_config.json");
     // let metadata_path = Path::new("khao_metadata.json");
 
-    let _installed_map = read_installed_addons()?;
+    let installed_map = read_installed_addons()?;
 
-    let _file_list = if file_list_path.exists() {
+    let file_list = if file_list_path.exists() {
         read_file_list(&file_list_path)?
     } else {
         write_file_list(&file_list_path).await?
@@ -329,7 +359,7 @@ async fn main() -> Result<()> {
 
     /*
      *    Unfortunately there is no global namespace for ESO addons.
-     *  There are three candidates for how we identify addons, each with flaws:
+     *  There are four candidates for how we identify addons, each with flaws:
      *     1) the "Title" field in the addon manifest:
      *        - color escapes are common in the title (but not in the api)
      *        - the API title doesn't come from or match the manifest, seems like maybe its supplied on upload
@@ -340,34 +370,36 @@ async fn main() -> Result<()> {
      *    3) the api ID
      *        - doesn't exist in the manifest, so we can only use this if we disregard existing installs and
      *              track separate metadata when installing to remember where it came from
+     *    4) cache archives, compare checksums ( or keep api version metadata about installed addons)
+     *       - doesn't accommodate install from other sources, existing installs
      */
 
     // for right now #2 gets most things right, just need some conflict resolution (maybe using author too)
     // and a map of string => vector of addons to handle multiple addons with the same path
 
     let filter_spaces = Regex::new("\\s")?;
-    let mut _file_map = MultiMap::new();
-    for mut x in _file_list {
+    let mut file_map = MultiMap::new();
+    for mut x in file_list {
         // XXX: why do I need to borrow?
         if let Some(addons) = &x.addons {
             for addon in addons {
                 if None == addon.path.find('/') {
-                    if let Some(ver) = &x.api_version {
+                    if let Some(ver) = &x.nested_version {
                         if &addon.add_on_version != ver {
                             println!("mismatch {} {}", &addon.add_on_version, &ver);
                         }
                     } else {
                        // println!("supp;ying missing version");
-                        x.api_version = Some(addon.add_on_version.clone());
+                        x.nested_version = Some(addon.add_on_version.clone());
                     }
 
-                    _file_map.insert(filter_spaces.replace_all(&addon.path, "").to_lowercase().to_string(), x);
+                    file_map.insert(filter_spaces.replace_all(&addon.path, "").to_lowercase().to_string(), x);
                     break;
                 }
             }
         }
 
-        //_file_map.insert(filter_spaces.replace_all(&x.title, "").to_lowercase().to_string(), &x);
+        //file_map.insert(filter_spaces.replace_all(&x.title, "").to_lowercase().to_string(), &x);
     }
 
     //println!("{}", serde_json::to_string_pretty(&file_list)?);
@@ -381,9 +413,9 @@ async fn main() -> Result<()> {
     // check all installed items are up to date
     let mut outdated = HashMap::new();
 
-    'outer: for (path, addon) in _installed_map {
-        if _file_map.is_vec(&path) {
-            for latest in _file_map.get_vec(&path).unwrap() {
+    'outer: for (path, addon) in installed_map {
+        if file_map.is_vec(&path) {
+            for latest in file_map.get_vec(&path).unwrap() {
                 //if addon.title == latest.title {
                     if compare_versions(&addon, &latest) {
                         continue 'outer;
@@ -391,15 +423,16 @@ async fn main() -> Result<()> {
                 //}
             }
             println!("  multi-outdated: {}", &path);
+
         } else {
-            let lookup = _file_map.get(&path);
+            let lookup = file_map.get(&path);
 
             if let Some(latest) = lookup {
                 if compare_versions(&addon, &latest) {
                     continue;
                 }
                 println!("  outdated: {:?} {:?} {:?}", &path, &addon.version_name, &latest.version);
-                outdated.insert(&latest.title, latest);
+                outdated.insert(addon.path.clone(), latest);
             } else {
                 println!("    {} {} no longer exists upstream!", addon.name, &path);
             }
@@ -409,9 +442,44 @@ async fn main() -> Result<()> {
 
     // check for a downloaded and installed version, and verify checksum
 
-    // check for a downloaded archive and verify check sum, else
-
     // fetch, extract, install
+
+    for (path, addon) in outdated {
+        let addon_dest = Path::new(&path);
+        let detail_url = FILE_DETAILS_URL.to_string() + &addon.id.to_string() + ".json";
+        let array:Vec<FileDetails> = reqwest::get(&detail_url).await?.json().await?;
+        let details = &array[0];
+
+        let mut please_download = true;
+
+        let addon_dir = download_dir.join(addon_dest.file_name().unwrap());
+        std::fs::create_dir_all(&addon_dir)?;
+        let filename = addon_dir.join(&details.file_name);
+        // check for a downloaded archive and verify check sum, else
+        if filename.exists() {
+            let mut download_dest = File::open(&filename)?;
+
+            let mut hasher = Md5::new();
+            std::io::copy(&mut download_dest, &mut hasher)?;
+            let hash = hasher.finalize();
+
+            // XXX: clean this up?
+            if hash == *GenericArray::from_slice(&<[u8; 16]>::from_hex(&details.checksum).unwrap()){
+                please_download = false;
+                println!("{:?} already downloaded", &download_dest);
+            }
+        }
+
+        if please_download {
+            let mut download_dest = File::create(&filename)?;
+            let download_response = reqwest::get(&details.download_uri).await?;
+
+            let mut content = download_response.bytes_stream();
+            while let Some(item) = content.next().await {
+                download_dest.write_all(&item?)?;
+            }
+        }
+    }
 
     Ok(())
 }
